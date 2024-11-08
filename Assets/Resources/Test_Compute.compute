@@ -1,0 +1,631 @@
+#include "../Shaders/RayTracing2DCommon.cginc"
+#include "../Shaders/Noise2D.cginc"
+
+#pragma kernel Simulate_DefaultLight
+#pragma kernel Simulate_PointLight
+#pragma kernel Simulate_SpotLight
+#pragma kernel Simulate_LaserLight
+#pragma kernel Simulate_AmbientLight
+#pragma kernel Simulate_FieldLight
+#pragma kernel Simulate_DirectionalLight
+#pragma kernel ConvertToHDR
+#pragma kernel ToneMap
+#pragma kernel MeasureConvergence
+#pragma kernel GenerateGBufferMips
+#pragma kernel GenerateTrainingSubstrate_MakeShapes
+#pragma kernel GenerateTrainingSubstrate_EdgeBlur_JFA
+#pragma kernel GenerateTrainingSubstrate_EdgeBlur
+#pragma kernel GenerateTrainingSubstrate_AddNoise
+#pragma kernel GenerateTrainingSubstrate_Gradient
+#pragma kernel GenerateTrainingSubstrate_Hardness
+
+struct Ray {
+    float2 Origin;
+    float2 Direction;
+    uint3 Energy;
+    float Reserved;
+};
+
+RWStructuredBuffer<uint4> g_rand;
+RWTexture2D<uint> g_photons;
+Texture2D<float4> g_albedo;
+Texture2D<float4> g_transmissibility;
+Texture2D<float4> g_normalSlope;
+Texture2D<float2> g_mieScatteringLUT;
+//RWTexture2D<float> g_importancePDF;
+
+RWTexture2D<float4> g_result;
+RWTexture2D<float4> g_previousResult;
+RWStructuredBuffer<uint> g_convergenceResult;
+RWStructuredBuffer<uint> g_traversalCount;
+
+uint g_time_ms;
+uint g_photons_per_thread;
+uint2 g_target_size;
+float g_energy_norm;
+uint g_bounces;
+float g_mip_test;
+uint g_lowest_lod;
+uint g_4x4_lod;
+
+float g_outscatterCoefficient;
+uint3 g_lightEnergy;
+float g_lightEmissionOutscatter;
+
+float2x3 g_worldToViewport;
+float2x3 g_viewportToTarget;
+float2x3 g_worldToTarget;
+float2x3 g_lightToWorld;
+float4x4 g_lightToTarget;
+
+SamplerState sampler_point_clamp;
+SamplerState sampler_linear_clamp;
+
+float Traverse(Ray ray) {
+    return 0.5f;
+}
+
+Ray BounceSurface(Ray incomingRay) {
+    return incomingRay;
+}
+
+Ray BounceInterior(Ray incomingRay) {
+    return incomingRay;
+}
+
+float Rand_Next(inout RandomContext __rc) {
+    __rc = NextRandom(__rc);
+    return __rc.value;
+}
+
+#define INIT_RAND(seed) RandomContext __rc = CreateRandomContext(seed);
+#define RAND() Rand_Next(__rc)
+#define RAND_RANGE(lo,hi) (lo + Rand_Next(__rc) * (hi - lo))
+#define RAND2() float2(RAND(), RAND())
+#define RAND3() float3(RAND(), RAND(), RAND())
+#define RAND4() float4(RAND(), RAND(), RAND(), RAND())
+#define RAND_DIRECTION() Rand_Direction_(__rc)
+#define RAND_CIRCLE() Rand_Circle_(__rc)
+#define RAND_SCATTER_MIE(incoming) Rand_Scatter_Mie_(__rc, incoming)
+#define SAVE_RAND(seed) seed = __rc.state;
+
+float2 Rand_Direction_(inout RandomContext __rc) {
+    float theta = RAND() * 2 * PI;
+    float2 dir;
+    sincos(theta, dir.x, dir.y);
+    return dir;
+}
+
+float2 Rand_Circle_(inout RandomContext __rc) {
+    return RAND_DIRECTION() * sqrt(RAND());
+}
+
+float2 Rand_Scatter_Mie_(inout RandomContext __rc, float2 incomingDirection) {
+    float2 perp = incomingDirection.yx;
+    perp.x *= -1;
+
+    float2 scatter = g_mieScatteringLUT.SampleLevel(sampler_linear_clamp, float2(RAND(), 0), 0);
+
+    return scatter.x * incomingDirection + scatter.y * perp;
+}
+
+////////////////
+// SIMULATION
+////////////////
+
+void WritePhoton(float2 location, uint3 energy) {
+    const uint EnergyMax = (1 << 31);
+    uint2 pixel = (location * (g_target_size-1) - 0.5f);
+
+    if(any(location < 0)) return;
+
+    pixel.x *= 3;
+    if(g_photons[pixel] < EnergyMax)
+        InterlockedAdd(g_photons[pixel], energy.r);
+    pixel.x++;
+    if(g_photons[pixel] < EnergyMax)
+        InterlockedAdd(g_photons[pixel], energy.g);
+    pixel.x++;
+    if(g_photons[pixel] < EnergyMax)
+        InterlockedAdd(g_photons[pixel], energy.b);
+}
+
+Ray EmitPointLight(inout RandomContext __rc) {
+    Ray emitted;
+
+    float2 pos = RAND_CIRCLE();
+
+    emitted.Origin = mul(float4(pos, 0, 1), g_lightToTarget).xy;
+    emitted.Direction = RAND_DIRECTION();
+    emitted.Energy = g_lightEnergy;
+    emitted.Reserved = 0;
+
+    return emitted;
+}
+
+Ray EmitSpotLight(inout RandomContext __rc) {
+    Ray emitted;
+
+    emitted.Origin = mul(float4(RAND()-0.5, RAND()-0.5, 0, 1), g_lightToTarget).xy;
+    emitted.Direction = normalize(mul(float4(2*RAND()-1, -1, 0, 0), g_lightToTarget).xy);
+    emitted.Energy = g_lightEnergy;
+    emitted.Reserved = 0;
+
+    return emitted;
+}
+
+Ray EmitLaserLight(inout RandomContext __rc) {
+    Ray emitted;
+
+    emitted.Origin = mul(float4(RAND()-0.5, RAND(), 0, 1), g_lightToTarget).xy;
+    emitted.Direction = normalize(mul(float4(0,-1,0,0), g_lightToTarget).xy);
+    emitted.Energy = g_lightEnergy;
+    emitted.Reserved = 0;
+
+    return emitted;
+}
+
+Ray EmitAmbientLight(inout RandomContext __rc) {
+    Ray emitted;
+
+    emitted.Origin = float2(RAND(), RAND());
+    emitted.Direction = normalize(RAND_DIRECTION() - (emitted.Origin * 2 - 1)/1.44);
+    emitted.Energy = g_lightEnergy;
+    emitted.Reserved = 0;
+
+    return emitted;
+}
+
+Texture2D<float4> g_lightFieldTexture;
+Ray EmitFieldLight(inout RandomContext __rc) {
+    Ray emitted;
+
+    float2 uv = RAND2();
+    float2 pos = uv*2-1;
+
+    float2 _ddx = ddx(g_lightToTarget._m00_m01);
+    float2 _ddy = ddy(g_lightToTarget._m10_m11);
+
+    emitted.Origin = mul(float4(pos, 0, 1), g_lightToTarget).xy;
+    emitted.Direction = RAND_DIRECTION();
+    float4 texValue = g_lightFieldTexture.SampleGrad(sampler_linear_clamp, uv, _ddx, _ddy);
+    texValue.rgb *= (texValue.a - 0.08);
+    emitted.Energy = g_lightEnergy * texValue.rgb;
+    emitted.Reserved = 0;
+
+    return emitted;
+}
+
+float2 g_directionalLightDirection;
+Ray EmitDirectionalLight(inout RandomContext __rc) {
+    Ray emitted;
+
+    float2 perp = g_directionalLightDirection.yx;
+    perp.y *= -1;
+    emitted.Direction = g_directionalLightDirection;
+
+    emitted.Origin = 0.5 - g_directionalLightDirection + perp * (RAND() * 1.415 - 0.7075);
+    emitted.Energy = g_lightEnergy;
+    emitted.Reserved = 0;
+
+    return emitted;
+}
+
+Ray EmitDefaultLight(inout RandomContext __rc) {
+    Ray emitted;
+
+    emitted.Origin = float2(RAND(), 0);
+    emitted.Direction = float2(0,1);
+    emitted.Energy = float3(0,1000,0);
+    emitted.Reserved = 0;
+
+    return emitted;
+}
+
+
+void SimulateOne(Ray photon, inout RandomContext __rc) {
+    if(g_lightEmissionOutscatter != 0) {
+        uint3 emissionOutscatter = photon.Energy * g_lightEmissionOutscatter;
+        // float4 test_sample = g_transmissibility.SampleLevel(sampler_point_clamp, photon.Origin, g_mip_test);
+        // emissionOutscatter = (uint3)(test_sample.ggg * 100);
+        WritePhoton(photon.Origin, emissionOutscatter);
+    }
+
+    for(uint bounce = 0;bounce < g_bounces;bounce++) {
+
+        if(photon.Direction.x == 0) photon.Direction.x = 1e-8;
+        if(photon.Direction.y == 0) photon.Direction.y = 1e-8;
+
+        float4 uBoundaryBox = (float4(0,1,0,1) - photon.Origin.xxyy) / photon.Direction.xxyy;
+        float uEscape = min(max(uBoundaryBox[0], uBoundaryBox[1]), max(uBoundaryBox[2], uBoundaryBox[3]));
+
+        float w = 1.0 / g_target_size.x * (1 << 0);
+        float lod = 0+0;
+
+        // Raycast to find collision or escape point
+        float uCollision = 10;
+        float uEnd = min(uEscape, uCollision);
+        
+        // Substrate traversal to collision point
+        float substrateTransmitPotential =  RAND(); //pow(RAND(),2);
+        float uTarget = RAND() * uEnd;
+        float netTransmissibility = 1;
+
+        float uScatter = 0;
+        bool wentToHigherLOD = false;
+
+        int steps;
+        for(steps = 0;steps < 2000;steps++) {
+            float2 pSample = photon.Origin + photon.Direction * (uScatter + w);
+            float4 T = g_transmissibility.SampleLevel(sampler_linear_clamp, pSample, lod);
+
+            if(T.z == 1 && lod < (float)g_lowest_lod && !wentToHigherLOD) { // Lower LOD is leaf, go lower
+                w *= 2;
+                lod++;
+            } else if(T.a < 1 || (substrateTransmitPotential > netTransmissibility * T.x && lod > 0)) { // Not Leaf, go higher
+                w /= 2;
+                lod--; 
+                wentToHigherLOD = true;
+            } else { // Leaf. Do it!
+                netTransmissibility *= T.x;
+                if(substrateTransmitPotential > netTransmissibility) { // Scatter occurs within this sample
+                    // The following line finds the scatter point at sub-pixel accuracy
+                    //uScatter += w * log2(substrateTransmitPotential) / log2(T.x);
+                    break;
+                } else { // Keep propagating
+                    uScatter += w;
+                    wentToHigherLOD = false;
+
+                    if(uScatter > uEnd) {
+                        break;
+                    }
+                }
+            }
+        }
+
+        if(uEnd < uScatter) break;
+
+        photon.Origin += photon.Direction * uScatter;
+
+        if(steps == 2000)
+            WritePhoton(photon.Origin, uint3(1000000000, 1000000000, 0));
+
+        float3 albedo = g_albedo.SampleLevel(sampler_point_clamp, photon.Origin, 0).rgb;
+
+        //photon.Energy *= netTransmissibility;
+        photon.Energy *= albedo;
+
+        uint3 outScatter = photon.Energy * g_outscatterCoefficient;
+        
+        WritePhoton(photon.Origin, outScatter);
+        photon.Direction = RAND_SCATTER_MIE(photon.Direction);
+        photon.Energy -= outScatter;
+    }
+}
+
+#define SIMULATION_IMPLEMENTATION(lightType)                    \
+[numthreads(64,1,1)]                                            \
+void Simulate_##lightType (uint3 id : SV_DispatchThreadID) {    \
+    INIT_RAND(g_rand[id.x])                                     \
+    for(uint i = 0;i < g_photons_per_thread;i++) {              \
+        SimulateOne(Emit##lightType(__rc), __rc); }             \
+    SAVE_RAND(g_rand[id.x])                                     \
+}
+
+SIMULATION_IMPLEMENTATION(DefaultLight)
+SIMULATION_IMPLEMENTATION(PointLight)
+SIMULATION_IMPLEMENTATION(SpotLight)
+SIMULATION_IMPLEMENTATION(LaserLight)
+SIMULATION_IMPLEMENTATION(AmbientLight)
+SIMULATION_IMPLEMENTATION(FieldLight)
+SIMULATION_IMPLEMENTATION(DirectionalLight)
+
+RWTexture2D<float4> g_hdrResult;
+
+[numthreads(8,8,1)]
+void ConvertToHDR (uint3 id : SV_DispatchThreadID) {
+    uint2 photonLoc = id.xy; 
+    photonLoc.x *= 3;
+
+    float3 output;
+
+    output.r = g_photons[photonLoc] / g_energy_norm;
+    photonLoc.x++;
+    output.g = g_photons[photonLoc] / g_energy_norm;
+    photonLoc.x++;
+    output.b = g_photons[photonLoc] / g_energy_norm;
+
+    g_hdrResult[id.xy] = float4(output, 1);
+}
+
+float3 ToneMap_ApproximationA(float3 x) {
+    x = max(0, x - 0.004);
+    return (x*(6.2*x+0.5))/(x*(6.2*x+1.7)+0.06);
+}
+
+[numthreads(8,8,1)]
+void ToneMap (uint3 id : SV_DispatchThreadID) {
+    uint2 photonLoc = id.xy; 
+    photonLoc.x *= 3;
+
+    float3 output;
+
+    output.r = g_photons[photonLoc] / g_energy_norm;
+    photonLoc.x++;
+    output.g = g_photons[photonLoc] / g_energy_norm;
+    photonLoc.x++;
+    output.b = g_photons[photonLoc] / g_energy_norm;
+    
+    //g_result[id.xy] = float4(ToneMap_ApproximationA(output.rgb), 1);
+    g_result[id.xy] = float4(smoothstep(-4, 2, log10(output)), 1); // bit silly but... works?
+}
+
+[numthreads(8,8,1)]
+void MeasureConvergence (uint3 id : SV_DispatchThreadID) {
+    float4 a = pow(g_result[id.xy], 1/2.2);
+    float4 b = pow(g_previousResult[id.xy], 1/2.2);
+
+    float4 delta = abs(a - b) * 256;
+
+    if(max(delta.r, max(delta.g, delta.b)) > 1) {
+        InterlockedAdd(g_convergenceResult[0], 1);
+    }
+}
+
+
+/////////////////////////
+// G BUFFER PROCESSING
+/////////////////////////
+
+RWTexture2D<float4> g_sourceMipLevelAlbedo;
+RWTexture2D<float4> g_sourceMipLevelNormalSlope;
+RWTexture2D<float4> g_sourceMipLevelTransmissibility;
+RWTexture2D<float4> g_destMipLevelAlbedo;
+RWTexture2D<float4> g_destMipLevelNormalSlope;
+RWTexture2D<float4> g_destMipLevelTransmissibility;
+float g_TransmissibilityVariationEpsilon;
+
+float4 DownsampleAlbedo(uint2 id) {
+    float4 a = g_sourceMipLevelAlbedo[id + uint2(0,0)];
+    float4 b = g_sourceMipLevelAlbedo[id + uint2(1,0)];
+    float4 c = g_sourceMipLevelAlbedo[id + uint2(0,1)];
+    float4 d = g_sourceMipLevelAlbedo[id + uint2(1,1)];
+
+    return (a+b+c+d)/4;
+}
+
+float4 DownsampleTransmissibility(uint2 id) {
+    float4 a = g_sourceMipLevelTransmissibility[id + uint2(0,0)];
+    float4 b = g_sourceMipLevelTransmissibility[id + uint2(1,0)];
+    float4 c = g_sourceMipLevelTransmissibility[id + uint2(0,1)];
+    float4 d = g_sourceMipLevelTransmissibility[id + uint2(1,1)];
+
+    // Right now, Sample = T.  T is usually almost 1, microscopically less than.
+    // What if Sample = 1 / T - 1?  Storage accuracy might improve a lot.
+    // Can we do it?
+    // In that case,  T = 1 / (Sample + 1)
+    // So combining samples:
+    // Tx * Ty = 1 / (SampleX + 1) * 1 / (SampleY + 1) = 1 / ((SampleX + 1) * (SampleY + 1))
+    // Storing a combined sample:
+    // SampleXY = (SampleX + 1) * (SampleY + 1) - 1 = SampleX * SampleY + SampleX + SampleY
+    // Average samples ABCD:
+    // (AB + A + B + CD + C + D + AC + A + C + BD + B + D) / 4 = (AB + CD + AC + BD + 2A + 2B + 2C + 2D) / 4
+    // = (AB + CD + AC + BD) / 4 + (A+B+C+D)/2
+    // Variance Computation
+    // SampleXX = (SampleX + 1) * (SampleX + 1) - 1 = SampleX^2 + 2*SampleX
+    // 1*SampleX^2 + 2*SampleX - SampleXX = 0
+    // SampleX = sqrt(4+SampleXX)/2 - 1
+
+    float at = 1 / (a.x + 1);
+    float bt = 1 / (b.x + 1);
+    float ct = 1 / (c.x + 1);
+    float dt = 1 / (d.x + 1);
+
+    // [OPTIMIZED] float average = (a.x*b.x + c.x*d.x + a.x*c.x + b.x*d.x) / 4 + (a.x + b.x + c.x + d.x) / 2;
+    // [OPTIMIZED] float average = (at*bt + ct*dt + at*ct + bt*dt) / 4;
+    float average = (a.x*b.x + c.x*d.x + a.x*c.x + b.x*d.x) / 4;
+    float minimum = min(min(a.y*b.y, c.y*d.y), min(a.y*c.y, b.y*d.y));
+
+    // [OPTIMIZED] float sr_avg = sqrt(4+average)/2 - 1;
+    float sr_avg = sqrt(average);
+    float4 variances = float4(a.x,b.x,c.x,d.x) - sr_avg;
+    // [OPTIMIZED] float4 variances = float4(at, bt, ct, dt) - sr_avg;
+    variances *= variances;
+    float variance = dot(variances, 0.25);
+    float leaf = variance < g_TransmissibilityVariationEpsilon ? 1 : 0;
+
+    a.z = b.z = c.z = d.z = leaf;
+
+    g_sourceMipLevelTransmissibility[id + uint2(0,0)] = a;
+    g_sourceMipLevelTransmissibility[id + uint2(1,0)] = b;
+    g_sourceMipLevelTransmissibility[id + uint2(0,1)] = c;
+    g_sourceMipLevelTransmissibility[id + uint2(1,1)] = d;
+
+    return float4(average, minimum, 0, leaf);
+    // [OPTIMIZED] return float4(1/average - 1, minimum, 0, leaf);
+}
+
+float4 DownsampleNormalSlope(uint2 id) {
+    float4 a = g_sourceMipLevelNormalSlope[id + uint2(0,0)];
+    float4 b = g_sourceMipLevelNormalSlope[id + uint2(1,0)];
+    float4 c = g_sourceMipLevelNormalSlope[id + uint2(0,1)];
+    float4 d = g_sourceMipLevelNormalSlope[id + uint2(1,1)];
+
+    return float4(normalize(a.xy + b.xy + c.xy + d.xy), (a.zw + b.zw + c.zw + d.zw) / 4);
+}
+
+[numthreads(8,8,1)]
+void GenerateGBufferMips (uint3 id : SV_DispatchThreadID) {
+    g_destMipLevelAlbedo[id.xy] = DownsampleAlbedo(id.xy * 2);
+    g_destMipLevelTransmissibility[id.xy] = DownsampleTransmissibility(id.xy * 2);
+    g_destMipLevelNormalSlope[id.xy] = DownsampleNormalSlope(id.xy * 2);
+}
+
+
+
+////////////////////////////////
+// TRAINING SCENE GENERATORS
+/////////////////////////////////
+
+RWTexture2D<float4> g_trainingSubstrate_textureDest;
+RWTexture2D<float4> g_trainingSubstrate_textureRef;
+float2 g_trainingSubstrate_size;
+int4 g_trainingSubstrate_ShapeCounts; // (Rect, Ellipse, Inverse Rect, Inverse Ellipse)
+float4x4 g_trainingSubstrate_ShapeTransforms[16];
+float g_trainingSubstrate_edgeBlur;
+float2 g_trainingSubstrate_noiseSeed;
+float2 g_trainingSubstrate_noiseFrequencyMinMax;
+float2 g_trainingSubstrate_noiseClipValues;
+float3 g_trainingSubstrate_gradientDirection;
+float2 g_trainingSubstrate_gradientDensity;
+float3 g_trainingSubstrate_gradientColorA;
+float3 g_trainingSubstrate_gradientColorB;
+float g_trainingSubstrate_hardness;
+
+[numthreads(8,8,1)]
+void GenerateTrainingSubstrate_MakeShapes(uint3 id : SV_DispatchThreadID) {
+    int totalRects = g_trainingSubstrate_ShapeCounts.x;
+    int totalEllipses = g_trainingSubstrate_ShapeCounts.y;
+    int totalInverseRects = g_trainingSubstrate_ShapeCounts.z;
+    int totalInverseEllipses = g_trainingSubstrate_ShapeCounts.w;
+
+    float2 xy = ((float2)id.xy + 0.5) / g_trainingSubstrate_size * 2 - 1;
+
+    // Draw shapes!
+    bool inside = false;
+    int currentTransformIndex = 0;
+    int i;
+    for(i = 0;i < totalRects;i++) {
+        float2 txy = mul(float4(xy,0,1), g_trainingSubstrate_ShapeTransforms[currentTransformIndex]).xy;
+        inside = inside || all(abs(txy.xy) <= 1);
+        currentTransformIndex++;
+    }
+    for(i = 0;i < totalEllipses;i++) {
+        float2 txy = mul(float4(xy,0,1), g_trainingSubstrate_ShapeTransforms[currentTransformIndex]).xy;
+        inside = inside || dot(txy.xy, txy.xy) <= 1;
+        currentTransformIndex++;
+    }
+    for(i = 0;i < totalInverseRects;i++) {
+        float2 txy = mul(float4(xy,0,1), g_trainingSubstrate_ShapeTransforms[currentTransformIndex]).xy;
+        inside = inside && !all(abs(txy.xy) <= 1);
+        currentTransformIndex++;
+    }
+    for(i = 0;i < totalInverseEllipses;i++) {
+        float2 txy = mul(float4(xy,0,1), g_trainingSubstrate_ShapeTransforms[currentTransformIndex]).xy;
+        inside = inside && !(dot(txy.xy, txy.xy) <= 1);
+        currentTransformIndex++;
+    }
+
+    if(inside) {
+        g_trainingSubstrate_textureDest[id.xy] = float4(1,   -1,   -1, 1);
+    } else {
+        g_trainingSubstrate_textureDest[id.xy] = float4(0, id.x, id.y, 0);
+    }
+
+    // - 2. Edge blur.
+    // - 3. noise or no?
+    // - 4. If yes, choose frequencies (min/max, pow2), floor, ceiling, and modulate
+    // - 6. Intensity and color (linear gradient)
+    // - 5. Grade power (0.1..10) or x^(10^(RAND()*2-1))
+    // - 7. Apply and Repeat (1-4 times total)
+}
+
+int g_trainingSubstrate_edgeBlurStage;
+[numthreads(8,8,1)]
+void GenerateTrainingSubstrate_EdgeBlur_JFA(uint3 id : SV_DispatchThreadID) {
+    float2 closest;
+    float closest_distance = 1.e6;
+
+    float4 pixel = g_trainingSubstrate_textureRef[id.xy];
+
+    if(pixel.x == 0) {
+        g_trainingSubstrate_textureDest[id.xy] = pixel;
+        return;
+    }
+
+    for(int i = -1;i <= 1;i++) {
+        for(int j = -1;j <= 1;j++) {
+            float4 c = g_trainingSubstrate_textureRef[id.xy +
+                uint2(i * g_trainingSubstrate_edgeBlurStage,
+                      j * g_trainingSubstrate_edgeBlurStage)];
+
+            if(c.y != -1) {
+                float2 delta = c.yz - id.xy;
+                float c_dist = dot(delta, delta);
+                if(c_dist < closest_distance) {
+                    closest = c.yz;
+                    closest_distance = c_dist;
+                }
+            }
+        }
+    }
+
+    pixel.yz = closest;
+    g_trainingSubstrate_textureDest[id.xy] = pixel;
+}
+
+[numthreads(8,8,1)]
+void GenerateTrainingSubstrate_EdgeBlur(uint3 id : SV_DispatchThreadID) {
+    float4 pixel = g_trainingSubstrate_textureRef[id.xy];
+    float dist = length(pixel.yz - id.xy);
+    dist /= (g_trainingSubstrate_edgeBlur + 1);
+    g_trainingSubstrate_textureDest[id.xy] = float4(pixel.rgb, pixel.a * saturate(dist));
+}
+
+[numthreads(8,8,1)]
+void GenerateTrainingSubstrate_AddNoise(uint3 id : SV_DispatchThreadID) {
+    INIT_RAND(0)
+    
+    float max_amplitude = 0;
+    float amplitude = 1;
+    float freq = g_trainingSubstrate_noiseFrequencyMinMax.x;
+    float2 uv = (id.xy + 0.5) / g_trainingSubstrate_size + g_trainingSubstrate_noiseSeed;
+
+    float noise_cloud = 0;
+    while(freq <= g_trainingSubstrate_noiseFrequencyMinMax.y) {
+        noise_cloud += amplitude * snoise01(uv.xy * freq);
+        max_amplitude += amplitude;
+        amplitude /= 2;
+        freq *= 2;
+        uv += 10*RAND();
+    }
+
+    noise_cloud /= max_amplitude;  // ensure bounds [0,1]
+    noise_cloud -= g_trainingSubstrate_noiseClipValues.x; // floor moved to 0
+    noise_cloud /= (g_trainingSubstrate_noiseClipValues.y - g_trainingSubstrate_noiseClipValues.x); // ceiling scaled to 1
+    noise_cloud = saturate(noise_cloud); // clamp to [0,1] again
+
+    float4 pixel = g_trainingSubstrate_textureRef[id.xy];
+    g_trainingSubstrate_textureDest[id.xy] = float4(pixel.rgb, pixel.a * noise_cloud);
+}
+
+[numthreads(8,8,1)]
+void GenerateTrainingSubstrate_Gradient(uint3 id : SV_DispatchThreadID) {
+    float2 xy = (id.xy + 0.5) / g_trainingSubstrate_size * 2 - 1;
+    float grad = saturate(dot(g_trainingSubstrate_gradientDirection, float3(xy, 1)));
+    float density = lerp(g_trainingSubstrate_gradientDensity.x, g_trainingSubstrate_gradientDensity.y, grad);
+    float3 color = lerp(g_trainingSubstrate_gradientColorA, g_trainingSubstrate_gradientColorB, grad);
+
+    float4 pixel = g_trainingSubstrate_textureRef[id.xy];
+
+    float net_density;
+    if(density > 1) {
+        net_density = lerp(pixel.a, 1, density - 1);
+    } else {
+        net_density = pixel.a * density;
+    }
+
+    g_trainingSubstrate_textureDest[id.xy] = float4(color, net_density);
+}
+
+[numthreads(8,8,1)]
+void GenerateTrainingSubstrate_Hardness(uint3 id : SV_DispatchThreadID) {
+    float4 pixel = g_trainingSubstrate_textureRef[id.xy];
+    float4 l = g_trainingSubstrate_textureRef[id.xy - uint2(1,0)];
+    float4 r = g_trainingSubstrate_textureRef[id.xy + uint2(1,0)];
+    float4 u = g_trainingSubstrate_textureRef[id.xy + uint2(0,1)];
+    float4 d = g_trainingSubstrate_textureRef[id.xy - uint2(0,1)];
+
+    float4 avg = pixel / 2 + (l + r + u + d) / 8;
+    g_trainingSubstrate_textureDest[id.xy] = float4(pixel.xyz, pow(pixel.a, g_trainingSubstrate_hardness));
+}

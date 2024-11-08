@@ -1,0 +1,10 @@
+data/**
+Library/**
+Logs/**
+Packages/**
+__pycache__/**
+training_output/**
+UserSettings/**
+.vscode/**
+*.csproj
+*.sln
