@@ -12,6 +12,8 @@
 #pragma kernel ToneMap
 #pragma kernel MeasureConvergence
 #pragma kernel GenerateGBufferMips
+#pragma kernel ComputeGBufferVariance
+#pragma kernel GenerateGBufferQuadTree
 #pragma kernel GenerateTrainingSubstrate_MakeShapes
 #pragma kernel GenerateTrainingSubstrate_EdgeBlur_JFA
 #pragma kernel GenerateTrainingSubstrate_EdgeBlur
@@ -30,7 +32,9 @@ RWStructuredBuffer<uint4> g_rand;
 RWTexture2D<uint> g_photons;
 Texture2D<float4> g_albedo;
 Texture2D<float4> g_transmissibility;
+SamplerState samplerg_transmissibility;
 Texture2D<float4> g_normalSlope;
+Texture2D<float4> g_quadTreeLeaves;
 Texture2D<float2> g_mieScatteringLUT;
 //RWTexture2D<float> g_importancePDF;
 
@@ -141,7 +145,7 @@ Ray EmitPointLight(inout RandomContext __rc) {
     emitted.Reserved = 0;
 
     return emitted;
-}
+} 
 
 Ray EmitSpotLight(inout RandomContext __rc) {
     Ray emitted;
@@ -226,10 +230,10 @@ Ray EmitDefaultLight(inout RandomContext __rc) {
 void SimulateOne(Ray photon, inout RandomContext __rc) {
     if(g_lightEmissionOutscatter != 0) {
         uint3 emissionOutscatter = photon.Energy * g_lightEmissionOutscatter;
-        // float4 test_sample = g_transmissibility.SampleLevel(sampler_point_clamp, photon.Origin, g_mip_test);
-        // emissionOutscatter = (uint3)(test_sample.ggg * 100);
         WritePhoton(photon.Origin, emissionOutscatter);
     }
+
+    float2 pixelSize = 1.0 / g_target_size;
 
     for(uint bounce = 0;bounce < g_bounces;bounce++) {
 
@@ -239,15 +243,15 @@ void SimulateOne(Ray photon, inout RandomContext __rc) {
         float4 uBoundaryBox = (float4(0,1,0,1) - photon.Origin.xxyy) / photon.Direction.xxyy;
         float uEscape = min(max(uBoundaryBox[0], uBoundaryBox[1]), max(uBoundaryBox[2], uBoundaryBox[3]));
 
-        float w = 1.0 / g_target_size.x * (1 << 0);
-        float lod = 0+0;
+        float w = pixelSize.x * (1 << 0);
+        uint lod = 0+0;
 
         // Raycast to find collision or escape point
         float uCollision = 10;
         float uEnd = min(uEscape, uCollision);
         
         // Substrate traversal to collision point
-        float substrateTransmitPotential =  RAND(); //pow(RAND(),2);
+        float substrateTransmitPotential =  RAND();
         float uTarget = RAND() * uEnd;
         float netTransmissibility = 1;
 
@@ -256,29 +260,31 @@ void SimulateOne(Ray photon, inout RandomContext __rc) {
 
         int steps;
         for(steps = 0;steps < 2000;steps++) {
-            float2 pSample = photon.Origin + photon.Direction * (uScatter + w);
-            float4 T = g_transmissibility.SampleLevel(sampler_linear_clamp, pSample, lod);
+            float minimumTransmissibility = 0;
+            float4 T;
 
-            if(T.z == 1 && lod < (float)g_lowest_lod && !wentToHigherLOD) { // Lower LOD is leaf, go lower
-                w *= 2;
-                lod++;
-            } else if(T.a < 1 || (substrateTransmitPotential > netTransmissibility * T.x && lod > 0)) { // Not Leaf, go higher
-                w /= 2;
-                lod--; 
-                wentToHigherLOD = true;
-            } else { // Leaf. Do it!
-                netTransmissibility *= T.x;
-                if(substrateTransmitPotential > netTransmissibility) { // Scatter occurs within this sample
-                    // The following line finds the scatter point at sub-pixel accuracy
-                    //uScatter += w * log2(substrateTransmitPotential) / log2(T.x);
+            float2 pSample = photon.Origin + photon.Direction * uScatter;
+            uint4 quadTree = g_quadTreeLeaves.SampleLevel(sampler_point_clamp, pSample, 0);
+            lod = quadTree.x;
+            lod++;
+            while(minimumTransmissibility * netTransmissibility < substrateTransmitPotential && lod > 0) {
+                lod--;
+                T = g_transmissibility.SampleLevel(samplerg_transmissibility, pSample, lod);
+                minimumTransmissibility = T.y;
+            }
+            float transmissibility = T.x;
+            //float transmissibility = sqrt(T.x);  // Distributes samples more evenly, but energy needs to compensate.
+            netTransmissibility *= transmissibility;
+
+            if(substrateTransmitPotential > netTransmissibility) { // Scatter occurs within this sample
+                // The following line finds the scatter point at sub-pixel accuracy
+                //uScatter += w * log2(substrateTransmitPotential / netTransmissibility) / log2(transmissibility);
+                break;
+            } else { // Keep propagating
+                uScatter += w * (1 << lod);
+
+                if(uScatter > uEnd) {
                     break;
-                } else { // Keep propagating
-                    uScatter += w;
-                    wentToHigherLOD = false;
-
-                    if(uScatter > uEnd) {
-                        break;
-                    }
                 }
             }
         }
@@ -292,7 +298,6 @@ void SimulateOne(Ray photon, inout RandomContext __rc) {
 
         float3 albedo = g_albedo.SampleLevel(sampler_point_clamp, photon.Origin, 0).rgb;
 
-        //photon.Energy *= netTransmissibility;
         photon.Energy *= albedo;
 
         uint3 outScatter = photon.Energy * g_outscatterCoefficient;
@@ -311,6 +316,7 @@ void Simulate_##lightType (uint3 id : SV_DispatchThreadID) {    \
         SimulateOne(Emit##lightType(__rc), __rc); }             \
     SAVE_RAND(g_rand[id.x])                                     \
 }
+
 
 SIMULATION_IMPLEMENTATION(DefaultLight)
 SIMULATION_IMPLEMENTATION(PointLight)
@@ -383,6 +389,8 @@ RWTexture2D<float4> g_sourceMipLevelTransmissibility;
 RWTexture2D<float4> g_destMipLevelAlbedo;
 RWTexture2D<float4> g_destMipLevelNormalSlope;
 RWTexture2D<float4> g_destMipLevelTransmissibility;
+RWTexture2D<float4> g_destQuadTreeLeaves;
+
 float g_TransmissibilityVariationEpsilon;
 
 float4 DownsampleAlbedo(uint2 id) {
@@ -400,49 +408,21 @@ float4 DownsampleTransmissibility(uint2 id) {
     float4 c = g_sourceMipLevelTransmissibility[id + uint2(0,1)];
     float4 d = g_sourceMipLevelTransmissibility[id + uint2(1,1)];
 
-    // Right now, Sample = T.  T is usually almost 1, microscopically less than.
-    // What if Sample = 1 / T - 1?  Storage accuracy might improve a lot.
-    // Can we do it?
-    // In that case,  T = 1 / (Sample + 1)
-    // So combining samples:
-    // Tx * Ty = 1 / (SampleX + 1) * 1 / (SampleY + 1) = 1 / ((SampleX + 1) * (SampleY + 1))
-    // Storing a combined sample:
-    // SampleXY = (SampleX + 1) * (SampleY + 1) - 1 = SampleX * SampleY + SampleX + SampleY
-    // Average samples ABCD:
-    // (AB + A + B + CD + C + D + AC + A + C + BD + B + D) / 4 = (AB + CD + AC + BD + 2A + 2B + 2C + 2D) / 4
-    // = (AB + CD + AC + BD) / 4 + (A+B+C+D)/2
-    // Variance Computation
-    // SampleXX = (SampleX + 1) * (SampleX + 1) - 1 = SampleX^2 + 2*SampleX
-    // 1*SampleX^2 + 2*SampleX - SampleXX = 0
-    // SampleX = sqrt(4+SampleXX)/2 - 1
-
     float at = 1 / (a.x + 1);
     float bt = 1 / (b.x + 1);
     float ct = 1 / (c.x + 1);
     float dt = 1 / (d.x + 1);
 
-    // [OPTIMIZED] float average = (a.x*b.x + c.x*d.x + a.x*c.x + b.x*d.x) / 4 + (a.x + b.x + c.x + d.x) / 2;
-    // [OPTIMIZED] float average = (at*bt + ct*dt + at*ct + bt*dt) / 4;
     float average = (a.x*b.x + c.x*d.x + a.x*c.x + b.x*d.x) / 4;
     float minimum = min(min(a.y*b.y, c.y*d.y), min(a.y*c.y, b.y*d.y));
 
-    // [OPTIMIZED] float sr_avg = sqrt(4+average)/2 - 1;
     float sr_avg = sqrt(average);
     float4 variances = float4(a.x,b.x,c.x,d.x) - sr_avg;
-    // [OPTIMIZED] float4 variances = float4(at, bt, ct, dt) - sr_avg;
     variances *= variances;
     float variance = dot(variances, 0.25);
-    float leaf = variance < g_TransmissibilityVariationEpsilon ? 1 : 0;
+    float leaf = (variance < g_TransmissibilityVariationEpsilon) ? 1 : 0;
 
-    a.z = b.z = c.z = d.z = leaf;
-
-    g_sourceMipLevelTransmissibility[id + uint2(0,0)] = a;
-    g_sourceMipLevelTransmissibility[id + uint2(1,0)] = b;
-    g_sourceMipLevelTransmissibility[id + uint2(0,1)] = c;
-    g_sourceMipLevelTransmissibility[id + uint2(1,1)] = d;
-
-    return float4(average, minimum, 0, leaf);
-    // [OPTIMIZED] return float4(1/average - 1, minimum, 0, leaf);
+    return float4(average, minimum, leaf, 1);
 }
 
 float4 DownsampleNormalSlope(uint2 id) {
@@ -461,7 +441,57 @@ void GenerateGBufferMips (uint3 id : SV_DispatchThreadID) {
     g_destMipLevelNormalSlope[id.xy] = DownsampleNormalSlope(id.xy * 2);
 }
 
+void ComputeTransmissibilityVariance(uint2 id) {
 
+    float3 r1 = float3(
+        g_sourceMipLevelTransmissibility[id + uint2(-1,-1)].x,
+        g_sourceMipLevelTransmissibility[id + uint2( 0,-1)].x,
+        g_sourceMipLevelTransmissibility[id + uint2( 1,-1)].x
+    );
+    float3 r2 = float3(
+        g_sourceMipLevelTransmissibility[id + uint2(-1, 0)].x,
+        g_sourceMipLevelTransmissibility[id + uint2( 0, 0)].x,
+        g_sourceMipLevelTransmissibility[id + uint2( 1, 0)].x
+    );
+    float3 r3 = float3(
+        g_sourceMipLevelTransmissibility[id + uint2(-1, 1)].x,
+        g_sourceMipLevelTransmissibility[id + uint2( 0, 1)].x,
+        g_sourceMipLevelTransmissibility[id + uint2( 1, 1)].x
+    );
+
+    
+    float mean = dot(r1, 1/9.0) + dot(r2, 1/9.0) + dot(r3, 1/9.0);
+    
+    float3 d1 = r1 - mean;
+    float3 d2 = r2 - mean;
+    float3 d3 = r3 - mean;
+
+    float variance = sqrt(dot(d1,d1) + dot(d2,d2) + dot(d3,d3)) / 3.0;
+    float leaf = (variance < g_TransmissibilityVariationEpsilon) ? 1 : 0;
+
+    float4 newValue = g_sourceMipLevelTransmissibility[id];
+    newValue.z = variance;
+    newValue.w = leaf;
+    g_sourceMipLevelTransmissibility[id] = newValue;
+}
+
+[numthreads(8,8,1)]
+void ComputeGBufferVariance (uint3 id : SV_DispatchThreadID) {
+    ComputeTransmissibilityVariance(id.xy);
+}
+
+[numthreads(8,8,1)]
+void GenerateGBufferQuadTree (uint3 id : SV_DispatchThreadID) {
+    float2 uv = (id.xy + 0.5) / g_target_size;
+    for(int i = g_lowest_lod;i >= 0;i--) {
+        float4 leaf = g_transmissibility.SampleLevel(samplerg_transmissibility, uv, i);
+
+        if(leaf.w == 1) {
+            g_destQuadTreeLeaves[id.xy] = float4(i,0,0,1);
+           break;
+        }
+  }
+}
 
 ////////////////////////////////
 // TRAINING SCENE GENERATORS

@@ -2,9 +2,13 @@ data/**
 Library/**
 Logs/**
 Packages/**
+Temp/**
 __pycache__/**
 training_output/**
 UserSettings/**
 .vscode/**
 *.csproj
 *.sln
+*.onnx
+*.onnx.meta
+*.blob

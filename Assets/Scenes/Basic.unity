@@ -579,7 +579,7 @@ MonoBehaviour:
   m_EditorClassIdentifier: 
   simulation: {fileID: 923172386}
   aiAccelerator: {fileID: 0}
-  type: 2
+  type: 7
 --- !u!1 &923172385
 GameObject:
   m_ObjectHideFlags: 0
@@ -622,7 +622,7 @@ MonoBehaviour:
   photonsPerThread: 128
   photonBounces: -1
   energyUnit: 100000
-  transmissibilityVariationEpsilon: 0.0000001
+  transmissibilityVariationEpsilon: 0.1
   outscatterCoefficient: 0.01
   framesSinceClear: 0
   convergenceProgress: 100000
@@ -1610,13 +1610,13 @@ Transform:
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 1839891431}
   serializedVersion: 2
-  m_LocalRotation: {x: -0, y: -0, z: 0.46462417, w: -0.885508}
-  m_LocalPosition: {x: 3.92, y: 4.13, z: -0.005840614}
-  m_LocalScale: {x: 0.4744, y: 1.9221506, z: 1}
+  m_LocalRotation: {x: -0, y: 0, z: -0.4671587, w: -0.8841735}
+  m_LocalPosition: {x: -4.96, y: 4.03, z: -0.005840614}
+  m_LocalScale: {x: 0.107261844, y: 0.33272427, z: 1}
   m_ConstrainProportionsScale: 0
   m_Children: []
   m_Father: {fileID: 20753516}
-  m_LocalEulerAnglesHint: {x: 0, y: 0, z: -55.372}
+  m_LocalEulerAnglesHint: {x: 0, y: 0, z: -304.3}
 --- !u!212 &1839891433
 SpriteRenderer:
   m_ObjectHideFlags: 0
@@ -1684,8 +1684,8 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 14a0e5c7ca6748d2da91c7d70db73a3a, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  intensity: 0.13
-  bounces: 1
+  intensity: 2.7
+  bounces: 3
 --- !u!1 &2123204530
 GameObject:
   m_ObjectHideFlags: 0
@@ -1807,7 +1807,7 @@ PrefabInstance:
       objectReference: {fileID: 0}
     - target: {fileID: 7211980385114862445, guid: 6a50d69d76eca14f99a3a4adbf059f94, type: 3}
       propertyPath: substrateLogDensity
-      value: -2.16
+      value: -1.22
       objectReference: {fileID: 0}
     - target: {fileID: 7876814041424374406, guid: 6a50d69d76eca14f99a3a4adbf059f94, type: 3}
       propertyPath: m_LocalPosition.x

@@ -6,6 +6,7 @@ using Unity.Mathematics;
 using UnityEngine.Rendering;
 using Unity.Collections;
 using System.Linq;
+using System.Threading;
 
 
 public delegate void SimulationStepEvent(int frameCount);
@@ -45,7 +46,7 @@ public class Simulation : MonoBehaviour
 
     private RenderTexture[] _renderTexture = new RenderTexture[2];
     private int _currentRenderTextureIndex = 0;
-    private RenderBuffer[] _gBuffer;
+    private RenderBuffer[][] _gBuffer;
     private Texture _mieScatteringLUT;
     private int[] _kernelsHandles;
 
@@ -63,9 +64,15 @@ public class Simulation : MonoBehaviour
 
     public uint TraversalsPerSecond { get; private set; }
 
+    private RenderTexture[] _gBufferAlbedo = new RenderTexture[2];
+    private RenderTexture[] _gBufferTransmissibility = new RenderTexture[2];
+    private RenderTexture[] _gBufferNormalSlope = new RenderTexture[2];
+    private int _gBufferNextTarget = 0;
+
     public RenderTexture GBufferAlbedo { get; private set; }
     public RenderTexture GBufferTransmissibility { get; private set; }
     public RenderTexture GBufferNormalSlope { get; private set; }
+    public RenderTexture GBufferQuadTreeLeaves { get; private set; }
 
     public RenderTexture SimulationOutputRaw { get; private set; }
     public RenderTexture SimulationOutputHDR { get; private set; }
@@ -136,44 +143,45 @@ public class Simulation : MonoBehaviour
         };
         SimulationOutputHDR.Create();
 
-        GBufferAlbedo = new RenderTexture(textureResolution, textureResolution, 0, RenderTextureFormat.ARGBFloat)
+        for(int i = 0;i < 2;i++) {
+            _gBufferAlbedo[i] = new RenderTexture(textureResolution, textureResolution, 0, RenderTextureFormat.ARGBFloat)
+            {
+                enableRandomWrite = true,
+                useMipMap = true,
+                autoGenerateMips = false
+            };
+            _gBufferAlbedo[i].Create();
+            _gBufferAlbedo[i].GenerateMips();
+
+            _gBufferTransmissibility[i] = new RenderTexture(textureResolution, textureResolution, 0, RenderTextureFormat.ARGBFloat)
+            {
+                enableRandomWrite = true,
+                useMipMap = true,
+                autoGenerateMips = false
+            };
+            _gBufferTransmissibility[i].Create();
+            _gBufferTransmissibility[i].GenerateMips();
+
+            _gBufferNormalSlope[i] = new RenderTexture(textureResolution, textureResolution, 0, RenderTextureFormat.ARGBFloat)
+            {
+                enableRandomWrite = true,
+                useMipMap = true,
+                autoGenerateMips = false
+            };
+            _gBufferNormalSlope[i].Create();
+            _gBufferNormalSlope[i].GenerateMips();
+        }
+
+        GBufferQuadTreeLeaves = new RenderTexture(textureResolution, textureResolution, 0, RenderTextureFormat.ARGBHalf)
         {
             enableRandomWrite = true,
-            useMipMap = true,
-            autoGenerateMips = false
+            useMipMap = false,
         };
-        GBufferAlbedo.Create();
-        GBufferAlbedo.GenerateMips();
-
-        GBufferTransmissibility = new RenderTexture(textureResolution, textureResolution, 0, RenderTextureFormat.ARGBFloat)
-        {
-            enableRandomWrite = true,
-            useMipMap = true,
-            autoGenerateMips = false
-        };
-        GBufferTransmissibility.Create();
-        GBufferTransmissibility.GenerateMips();
-
-        GBufferNormalSlope = new RenderTexture(textureResolution, textureResolution, 0, RenderTextureFormat.ARGBFloat)
-        {
-            enableRandomWrite = true,
-            useMipMap = true,
-            autoGenerateMips = false
-        };
-        GBufferNormalSlope.Create();
-        GBufferNormalSlope.GenerateMips();
-
-        _gBuffer = new RenderBuffer[]
-        {
-            GBufferAlbedo.colorBuffer,
-            GBufferTransmissibility.colorBuffer,
-            GBufferNormalSlope.colorBuffer
-        };
-
+        GBufferQuadTreeLeaves.Create();
 
         _mieScatteringLUT = LUT.CreateMieScatteringLUT();
 
-        real_contentCamera = new GameObject("__Simulation_Camera", typeof(Camera)).GetComponent<Camera>();
+        real_contentCamera = new GameObject("__Simulation_Camera", typeof(Camera), typeof(SimulationCamera)).GetComponent<Camera>();
         real_contentCamera.transform.parent = transform;
         real_contentCamera.transform.localScale = new Vector3(1,1,1);
         real_contentCamera.transform.localRotation = Quaternion.identity;
@@ -188,11 +196,32 @@ public class Simulation : MonoBehaviour
         real_contentCamera.allowMSAA = false;
         real_contentCamera.useOcclusionCulling = false;
         real_contentCamera.gameObject.SetActive(false);
+
+        var camera_sim = real_contentCamera.GetComponent<SimulationCamera>();
+        camera_sim.Shader = _computeShader;
+        camera_sim.UpdateSimulation = Updater;
+
+        SwapGBuffer();
+    }
+
+    private void SwapGBuffer() {
+        GBufferAlbedo = _gBufferAlbedo[_gBufferNextTarget];
+        GBufferTransmissibility = _gBufferTransmissibility[_gBufferNextTarget];
+        GBufferNormalSlope = _gBufferNormalSlope[_gBufferNextTarget];
+
+        //_gBufferNextTarget = 1 - _gBufferNextTarget;
+
+        var camera_sim = real_contentCamera.GetComponent<SimulationCamera>();
+        camera_sim.GBufferAlbedo = _gBufferAlbedo[_gBufferNextTarget];
+        camera_sim.GBufferTransmissibility = _gBufferTransmissibility[_gBufferNextTarget];
+        camera_sim.GBufferNormalSlope = _gBufferNormalSlope[_gBufferNextTarget];
+        camera_sim.GBufferQuadTreeLeaves = GBufferQuadTreeLeaves;
+        camera_sim.VarianceEpsilon = transmissibilityVariationEpsilon;
     }
 
     private void OnDisable()
     {
-        DestroyImmediate(real_contentCamera);
+        Destroy(real_contentCamera);
         real_contentCamera = null;
 
         for(int i = 0;i < _renderTexture.Length;i++) {
@@ -209,14 +238,19 @@ public class Simulation : MonoBehaviour
         DestroyImmediate(SimulationOutputHDR);
         SimulationOutputHDR = null;
 
-        DestroyImmediate(GBufferAlbedo);
-        GBufferAlbedo = null;
+        for(int i = 0;i < 2;i++) {
+            DestroyImmediate(_gBufferAlbedo[i]);
+            _gBufferAlbedo[i] = null;
 
-        DestroyImmediate(GBufferTransmissibility);
-        GBufferTransmissibility = null;
+            DestroyImmediate(_gBufferTransmissibility[i]);
+            _gBufferTransmissibility[i] = null;
 
-        DestroyImmediate(GBufferNormalSlope);
-        GBufferNormalSlope = null;
+            DestroyImmediate(_gBufferNormalSlope[i]);
+            _gBufferNormalSlope[i] = null;
+        }
+
+        DestroyImmediate(GBufferQuadTreeLeaves);
+        GBufferQuadTreeLeaves = null;
 
         _randomBuffer.Release();
         _randomBuffer = null;
@@ -230,7 +264,12 @@ public class Simulation : MonoBehaviour
     float _previousOutscatterCoefficient;
     int _sceneId;
 
-    void Update()
+    void Update() {
+        real_contentCamera.Render();
+        SwapGBuffer();
+    }
+    
+    void Updater()
     {
         var worldToPresentationSpace = transform.worldToLocalMatrix;
         var presentationToTargetSpace = Matrix4x4.Translate(new Vector3(0.5f, 0.5f, 0));
@@ -301,35 +340,6 @@ public class Simulation : MonoBehaviour
 
         framesSinceClear++;
 
-        // G BUFFER PRODUCTION
-        {
-            RenderTexture rt = RenderTexture.active;
-            RenderTexture.active = GBufferAlbedo;
-            GL.Clear(false, true, new Color(0,0,0,1));
-            RenderTexture.active = GBufferTransmissibility;
-            GL.Clear(false, true, new Color(1,1,0,1));
-            RenderTexture.active = GBufferNormalSlope;
-            GL.Clear(false, true, new Color(0,0,0,0));
-            RenderTexture.active = rt;
-
-            real_contentCamera.SetTargetBuffers(_gBuffer, GBufferAlbedo.depthBuffer);
-            real_contentCamera.Render();
-        }
-
-        // MIPMAP PRODUCTION
-        var generateGBufferMipsKernel = _computeShader.FindKernel("GenerateGBufferMips");
-        int mipSize = GBufferTransmissibility.width;
-        for(int i = 1;i < GBufferTransmissibility.mipmapCount;i++) {
-            mipSize /= 2;
-            _computeShader.SetTexture(generateGBufferMipsKernel, "g_destMipLevelAlbedo", GBufferAlbedo, i);
-            _computeShader.SetTexture(generateGBufferMipsKernel, "g_sourceMipLevelAlbedo", GBufferAlbedo, i-1);
-            _computeShader.SetTexture(generateGBufferMipsKernel, "g_destMipLevelTransmissibility", GBufferTransmissibility, i);
-            _computeShader.SetTexture(generateGBufferMipsKernel, "g_sourceMipLevelTransmissibility", GBufferTransmissibility, i-1);
-            _computeShader.SetTexture(generateGBufferMipsKernel, "g_destMipLevelNormalSlope", GBufferNormalSlope, i);
-            _computeShader.SetTexture(generateGBufferMipsKernel, "g_sourceMipLevelNormalSlope", GBufferNormalSlope, i-1);
-            _computeShader.Dispatch(generateGBufferMipsKernel, Math.Max(1, mipSize / 8), Math.Max(1, mipSize / 8), 1);
-        }
-
         // RAY TRACING SIMULATION
         _computeShader.SetVector("g_target_size", new Vector2(textureResolution, textureResolution));
         _computeShader.SetInt("g_time_ms", Time.frameCount);
@@ -337,7 +347,7 @@ public class Simulation : MonoBehaviour
         _computeShader.SetFloat("g_energy_norm", framesSinceClear * energyNormPerFrame * energyUnit);
         _computeShader.SetMatrix("g_worldToTarget", Matrix4x4.identity);
         _computeShader.SetFloat("g_TransmissibilityVariationEpsilon", transmissibilityVariationEpsilon);
-        _computeShader.SetInt("g_lowest_lod", (int)(GBufferTransmissibility.mipmapCount - 1));
+        _computeShader.SetInt("g_lowest_lod", (int)(GBufferTransmissibility.mipmapCount - 4));
         _computeShader.SetInt("g_4x4_lod", (int)(GBufferTransmissibility.mipmapCount - 3));
         _computeShader.SetFloat("g_lightEmissionOutscatter", 0);
         _computeShader.SetFloat("g_outscatterCoefficient", outscatterCoefficient);
@@ -380,6 +390,7 @@ public class Simulation : MonoBehaviour
             _computeShader.SetTexture(simulateKernel, "g_albedo", GBufferAlbedo);
             _computeShader.SetTexture(simulateKernel, "g_transmissibility", GBufferTransmissibility);
             _computeShader.SetTexture(simulateKernel, "g_normalSlope", GBufferNormalSlope);
+            _computeShader.SetTexture(simulateKernel, "g_quadTreeLeaves", GBufferQuadTreeLeaves);
             _computeShader.SetTexture(simulateKernel, "g_mieScatteringLUT", _mieScatteringLUT);
 
             _computeShader.Dispatch(simulateKernel, threadCount / 64, 1, 1);

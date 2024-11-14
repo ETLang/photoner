@@ -6,6 +6,9 @@ Shader "RT/DiagnosticAShader"
         _filter ("Filter", Color) = (1,1,1,1) 
         _lod ("Level of Detail", Integer) = 0
         _mapping ("Value Mapping", Range(-1,1)) = 0
+        _low ("Lowerbound", Float) = 0
+        _high ("Upperbound", Float) = 1
+        _showAlpha ("Show Alpha", Float) = 0 
     }
     SubShader
     {
@@ -43,6 +46,9 @@ Shader "RT/DiagnosticAShader"
             float _lod;
             float4 _filter;
             float _mapping;
+            float _low;
+            float _high;
+            float _showAlpha;
 
             v2f vert (appdata v)
             {
@@ -54,10 +60,15 @@ Shader "RT/DiagnosticAShader"
 
             fixed4 frag (v2f i) : SV_Target
             {
-                // sample the texture
-                fixed4 col = pow(float4(_MainTex.SampleLevel(sampler_point_clamp, i.uv, _lod).rgb, 1) * _filter, pow(10, -_mapping));
-                // apply fog
-                return col;
+                float4 sample = _MainTex.SampleLevel(sampler_point_clamp, i.uv, _lod);
+
+                if(_showAlpha) {
+                    sample.rgb = sample.aaa;
+                }
+
+                sample = (sample - _low) / (_high - _low);
+
+                return pow(float4(sample.rgb, 1) * _filter, pow(10, -_mapping));
             }
             ENDCG
         }

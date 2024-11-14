@@ -9,7 +9,8 @@ public class SimulationTexturePicker : MonoBehaviour {
         AI_HDR,
         Albedo,
         Transmissibility,
-        NormalSlope
+        NormalSlope,
+        QuadTree,
     }
 
     [SerializeField] private Simulation simulation;
@@ -49,6 +50,9 @@ public class SimulationTexturePicker : MonoBehaviour {
             break;
         case TextureType.NormalSlope:
             value = simulation?.GBufferNormalSlope;
+            break;
+        case TextureType.QuadTree:
+            value = simulation?.GBufferQuadTreeLeaves;
             break;
         }
 
